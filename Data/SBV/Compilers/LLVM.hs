@@ -59,7 +59,7 @@ cgen cfg nm st sbvProg = result
                     , LLVM.defArgs    = args
                     , LLVM.defVarArgs = False
                     , LLVM.defSection = Nothing
-                    , LLVM.defBody    = body }
+                    , LLVM.defBody    = [body] }
 
   body = genLLVMProg sbvProg end
 
@@ -103,109 +103,52 @@ llvmType KReal          = error "llvmType: KReal"
 llvmType KUserSort{}    = error "llvmType: KUserSort"
 
 
-genLLVMProg :: Result -> Maybe (LLVM.Typed LLVM.Value) -> [LLVM.BasicBlock]
+genLLVMProg :: Result -> Maybe (LLVM.Typed LLVM.Value) -> LLVM.BasicBlock
 genLLVMProg
   (Result kindInfo _tvals cgs ins preConsts tbls arrs _ _ (SBVPgm asgns) cstrs _)
   resVar
-  = funBody (addEffect retStmt (toStmts asgns))
+  = block
   where
+
+  block =
+    LLVM.BasicBlock { LLVM.bbLabel = Nothing
+                    , LLVM.bbStmts = toStmts asgns ++ [retStmt] }
 
   retStmt =
     case resVar of
-      Just var -> LLVM.Ret var
-      Nothing  -> LLVM.RetVoid
+      Just var -> LLVM.Effect (LLVM.Ret var) []
+      Nothing  -> LLVM.Effect LLVM.RetVoid   []
 
-
-data PartialFun = PartialFun { pfBlock :: [LLVM.Stmt]
-                               -- ^ The current block
-                             , pfLabel :: LLVM.BlockLabel
-                               -- ^ The current label
-                             , pfBlocks :: [LLVM.BasicBlock]
-                               -- ^ Finished blocks
-                             , pfNext :: Int
-                               -- ^ Fresh names
-                             }
-
-initialFun :: PartialFun
-initialFun  = PartialFun { pfBlock  = []
-                         , pfLabel  = LLVM.Named (LLVM.Ident "BB0")
-                         , pfBlocks = []
-                         , pfNext   = 1 }
-
-addResult :: LLVM.Ident -> LLVM.Instr -> PartialFun -> PartialFun
-addResult i instr pf = pf { pfBlock = LLVM.Result i instr [] : pfBlock pf }
-
-newResult :: LLVM.Instr -> PartialFun -> (LLVM.Ident,PartialFun)
-newResult instr pf =
-  (name, addResult name instr pf { pfNext = pfNext pf + 1 })
-  where
-  name = LLVM.Ident ("res" ++ show (pfNext pf))
-
-addEffect :: LLVM.Instr -> PartialFun -> PartialFun
-addEffect instr pf = pf { pfBlock = LLVM.Effect instr [] : pfBlock pf }
-
--- | Close the current block, and return the name of the next block.
-closeBlock :: PartialFun -> (LLVM.BlockLabel,PartialFun)
-closeBlock pf = (label, pf { pfBlock  = []
-                           , pfLabel  = label
-                           , pfBlocks = block : pfBlocks pf
-                           , pfNext   = pfNext pf + 1 })
-  where
-  label = LLVM.Named (LLVM.Ident ("BB" ++ show (pfNext pf)))
-
-  block =
-    LLVM.BasicBlock { LLVM.bbLabel = Just (pfLabel pf)
-                    , LLVM.bbStmts = reverse (pfBlock pf) }
-
-funBody :: PartialFun -> [LLVM.BasicBlock]
-funBody pf = reverse (pfBlocks (snd (closeBlock pf)))
-
-toStmts :: Seq.Seq (SW,SBVExpr) -> PartialFun
-toStmts  = F.foldl (flip toStmt) initialFun
+toStmts :: Seq.Seq (SW,SBVExpr) -> [LLVM.Stmt]
+toStmts asgns = [ LLVM.Result (LLVM.Ident (show sw)) (toInstr e) []
+                | (sw,e) <- F.toList asgns ]
 
 swValue :: SW -> LLVM.Typed LLVM.Value
 swValue sw =
   LLVM.Typed { LLVM.typedType  = llvmType (kindOf sw)
              , LLVM.typedValue = LLVM.ValIdent (LLVM.Ident (show sw)) }
 
-toStmt :: (SW,SBVExpr) -> PartialFun -> PartialFun
-toStmt (res,SBVApp op sws) pf = case op of
+toInstr :: SBVExpr -> LLVM.Instr
+toInstr (SBVApp op sws) = case op of
 
   Ite | [c,t,f] <- args ->
-    let (lt,pft0) = closeBlock (addEffect (LLVM.Br c lt lf) pf)
-
-        (rt,pft1) = newResult (LLVM.Alloca resTy Nothing Nothing) pft0
-        (lf,pff0) = closeBlock
-                  $ addEffect (LLVM.Jump lk)
-                  $ addEffect (LLVM.Store t (resPtr rt) Nothing) pft1
-
-        (rf,pff1) = newResult (LLVM.Alloca resTy Nothing Nothing) pff0
-        (lk,pf')  = closeBlock
-                  $ addEffect (LLVM.Jump lk)
-                  $ addEffect (LLVM.Store f (resPtr rf) Nothing) pff1
-
-     in addResult resVal (LLVM.Phi resTy [ (LLVM.ValIdent rt, lt)
-                                         , (LLVM.ValIdent rf, lf) ]) pf'
+    LLVM.Select c t (LLVM.typedValue f)
 
   UNeg | [a] <- args ->
       let zero = const (LLVM.ValInteger 0) `fmap` a
           kind = kindOf (head sws)
-       in addResult resVal (llvmBinOp Minus kind zero (LLVM.typedValue a)) pf
+       in llvmBinOp Minus kind zero (LLVM.typedValue a)
 
       -- binary operators
   _ | op `elem` [ Plus, Times, Minus, Quot, Rem, Equal, NotEqual, LessThan
                 , GreaterThan ]
     , [a,b] <- args ->
       let kind = kindOf (head sws)
-       in addResult resVal (llvmBinOp op kind a (LLVM.typedValue b)) pf
+       in llvmBinOp op kind a (LLVM.typedValue b)
 
   _ -> die $ "Received operator " ++ show op ++ " applied to " ++ show sws
 
   where
-
-  resTy    = llvmType (kindOf res)
-  resPtr p = LLVM.Typed (LLVM.PtrTo resTy) (LLVM.ValIdent p)
-  resVal   = LLVM.Ident (show res)
 
   args = map swValue sws
 
