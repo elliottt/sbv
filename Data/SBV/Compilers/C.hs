@@ -156,11 +156,21 @@ pprCWord :: HasKind a => Bool -> a -> Doc
 pprCWord cnst v = (if cnst then text "const" else empty) <+> text (showCType v)
 
 showCType :: HasKind a => a -> String
-showCType = show . kindOf
+showCType  = show . sanitize . kindOf
+
+-- | Round words to c-type sized boundaries, leaving anything over 64 bits
+-- alone.
+sanitize :: Kind -> Kind
+sanitize (KBounded s w)
+  | w < 8     = KBounded s 8
+  | w < 16    = KBounded s 16
+  | w < 32    = KBounded s 32
+  | w < 64    = KBounded s 64
+sanitize k = k
 
 -- | The printf specifier for the type
 specifier :: CgConfig -> SW -> Doc
-specifier cfg sw = case kindOf sw of
+specifier cfg sw = case sanitize (kindOf sw) of
                      KBool         -> spec (False, 1)
                      KBounded b i  -> spec (b, i)
                      KUnbounded    -> spec (True, fromJust (cgInteger cfg))
@@ -178,6 +188,8 @@ specifier cfg sw = case kindOf sw of
         spec (True,  32) = text "%\"PRId32\"L"
         spec (False, 64) = text "0x%016\"PRIx64\"ULL"
         spec (True,  64) = text "%\"PRId64\"LL"
+
+        -- XXX this should only include cases > 64 bits
         spec (s, sz)     = die $ "Format specifier at type " ++ (if s then "SInt" else "SWord") ++ show sz
         specF :: CgSRealType -> Doc
         specF CgFloat      = text "%f"

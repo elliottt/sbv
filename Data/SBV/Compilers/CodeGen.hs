@@ -153,12 +153,16 @@ cgAddDecl ss = modify (\s -> let old = cgDecls s
 cgAddLDFlags :: [String] -> SBVCodeGen ()
 cgAddLDFlags ss = modify (\s -> s { cgLDFlags = cgLDFlags s ++ ss })
 
+-- | Creates an input, allowing the initial value to be specified.
+cgInput' :: SymWord a => String -> Symbolic (SBV a) -> SBVCodeGen (SBV a)
+cgInput' nm val = do r <- liftSymbolic val
+                     sw <- cgSBVToSW r
+                     modify (\s -> s { cgInputs = (nm, CgAtomic sw) : cgInputs s })
+                     return r
+
 -- | Creates an atomic input in the generated code.
 cgInput :: SymWord a => String -> SBVCodeGen (SBV a)
-cgInput nm = do r <- liftSymbolic forall_
-                sw <- cgSBVToSW r
-                modify (\s -> s { cgInputs = (nm, CgAtomic sw) : cgInputs s })
-                return r
+cgInput nm = cgInput' nm forall_
 
 -- | Creates an array input in the generated code.
 cgInputArr :: SymWord a => Int -> String -> SBVCodeGen [SBV a]

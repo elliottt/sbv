@@ -25,6 +25,7 @@ module Data.SBV.Internals (
   , ites, mdp, addPoly
   -- * Compilation to C
   , compileToC', compileToCLib', CgPgmBundle(..), CgPgmKind(..)
+  , cgInput'
   ) where
 
 import Data.SBV.BitVectors.Data       (Result, SBVRunMode(..), runSymbolic, runSymbolic', SBV(..), CW(..), Kind(..), CWVal(..), AlgReal(..), Quantifier(..), mkConstCW)
@@ -32,6 +33,6 @@ import Data.SBV.BitVectors.Data       (cache, sbvToSW, newExpr, normCW, SBVExpr(
 import Data.SBV.BitVectors.Model      (genVar, genVar_, slet, liftQRem, liftDMod, symbolicMergeWithKind, genLiteral, genFromCW, genMkSymVar)
 import Data.SBV.BitVectors.Splittable (checkAndConvert)
 import Data.SBV.Compilers.C           (compileToC', compileToCLib')
-import Data.SBV.Compilers.CodeGen     (CgPgmBundle(..), CgPgmKind(..))
+import Data.SBV.Compilers.CodeGen     (CgPgmBundle(..), CgPgmKind(..), cgInput')
 import Data.SBV.SMT.SMT               (genParse)
 import Data.SBV.Tools.Polynomial      (ites, mdp, addPoly)
