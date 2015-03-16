@@ -269,6 +269,9 @@ module Data.SBV (
   -- ** Compilation to C
   , compileToC, compileToCLib
 
+  -- ** Compilation to LLVM
+  , compileToLLVM
+
   -- * Module exports
   -- $moduleExportIntro
 
@@ -292,6 +295,7 @@ import Data.SBV.BitVectors.Splittable
 import Data.SBV.BitVectors.STree
 import Data.SBV.Compilers.C
 import Data.SBV.Compilers.CodeGen
+import Data.SBV.Compilers.LLVM
 import Data.SBV.Provers.Prover
 import Data.SBV.Tools.GenTest
 import Data.SBV.Tools.ExpectedValue
