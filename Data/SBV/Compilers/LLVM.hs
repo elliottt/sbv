@@ -5,6 +5,7 @@ import Data.SBV.BitVectors.PrettyNum (shex, showCFloat, showCDouble)
 import Data.SBV.Compilers.CodeGen
 
 import qualified Data.Foldable as F
+import qualified Data.Sequence as Seq
 import           System.Random (randoms,newStdGen)
 import qualified Text.LLVM.AST as LLVM
 import           Text.PrettyPrint.HughesPJ (render)
@@ -58,7 +59,7 @@ cgen cfg nm st sbvProg = result
                     , LLVM.defArgs    = args
                     , LLVM.defVarArgs = False
                     , LLVM.defSection = Nothing
-                    , LLVM.defBody    = [body] }
+                    , LLVM.defBody    = body }
 
   body = genLLVMProg sbvProg end
 
@@ -102,42 +103,145 @@ llvmType KReal          = error "llvmType: KReal"
 llvmType KUserSort{}    = error "llvmType: KUserSort"
 
 
-genLLVMProg :: Result -> Maybe (LLVM.Typed LLVM.Value) -> LLVM.BasicBlock
+genLLVMProg :: Result -> Maybe (LLVM.Typed LLVM.Value) -> [LLVM.BasicBlock]
 genLLVMProg
   (Result kindInfo _tvals cgs ins preConsts tbls arrs _ _ (SBVPgm asgns) cstrs _)
   resVar
-  = bblock
+  = funBody (addEffect retStmt (toStmts asgns))
   where
-
-  bblock = LLVM.BasicBlock { LLVM.bbLabel = Nothing
-                           , LLVM.bbStmts = stmts ++ [retStmt] }
 
   retStmt =
     case resVar of
-      Just var -> LLVM.Effect (LLVM.Ret var) []
-      Nothing  -> LLVM.Effect LLVM.RetVoid   []
-
-  stmts  = [ toStmt res expr | (res,expr) <- F.toList asgns ]
+      Just var -> LLVM.Ret var
+      Nothing  -> LLVM.RetVoid
 
 
-toStmt :: SW -> SBVExpr -> LLVM.Stmt
-toStmt res expr = LLVM.Result resVal (toInstr expr) []
+data PartialFun = PartialFun { pfBlock :: [LLVM.Stmt]
+                               -- ^ The current block
+                             , pfLabel :: LLVM.BlockLabel
+                               -- ^ The current label
+                             , pfBlocks :: [LLVM.BasicBlock]
+                               -- ^ Finished blocks
+                             , pfNext :: Int
+                               -- ^ Fresh names
+                             }
+
+initialFun :: PartialFun
+initialFun  = PartialFun { pfBlock  = []
+                         , pfLabel  = LLVM.Named (LLVM.Ident "BB0")
+                         , pfBlocks = []
+                         , pfNext   = 1 }
+
+addResult :: LLVM.Ident -> LLVM.Instr -> PartialFun -> PartialFun
+addResult i instr pf = pf { pfBlock = LLVM.Result i instr [] : pfBlock pf }
+
+newResult :: LLVM.Instr -> PartialFun -> (LLVM.Ident,PartialFun)
+newResult instr pf =
+  (name, addResult name instr pf { pfNext = pfNext pf + 1 })
+  where
+  name = LLVM.Ident ("res" ++ show (pfNext pf))
+
+addEffect :: LLVM.Instr -> PartialFun -> PartialFun
+addEffect instr pf = pf { pfBlock = LLVM.Effect instr [] : pfBlock pf }
+
+-- | Close the current block, and return the name of the next block.
+closeBlock :: PartialFun -> (LLVM.BlockLabel,PartialFun)
+closeBlock pf = (label, pf { pfBlock  = []
+                           , pfLabel  = label
+                           , pfBlocks = block : pfBlocks pf
+                           , pfNext   = pfNext pf + 1 })
+  where
+  label = LLVM.Named (LLVM.Ident ("BB" ++ show (pfNext pf)))
+
+  block =
+    LLVM.BasicBlock { LLVM.bbLabel = Just (pfLabel pf)
+                    , LLVM.bbStmts = reverse (pfBlock pf) }
+
+funBody :: PartialFun -> [LLVM.BasicBlock]
+funBody pf = reverse (pfBlocks (snd (closeBlock pf)))
+
+toStmts :: Seq.Seq (SW,SBVExpr) -> PartialFun
+toStmts  = F.foldl (flip toStmt) initialFun
+
+swValue :: SW -> LLVM.Typed LLVM.Value
+swValue sw =
+  LLVM.Typed { LLVM.typedType  = llvmType (kindOf sw)
+             , LLVM.typedValue = LLVM.ValIdent (LLVM.Ident (show sw)) }
+
+toStmt :: (SW,SBVExpr) -> PartialFun -> PartialFun
+toStmt (res,SBVApp op sws) pf = case op of
+
+  Ite | [c,t,f] <- args ->
+    let (lt,pft0) = closeBlock (addEffect (LLVM.Br c lt lf) pf)
+
+        (rt,pft1) = newResult (LLVM.Alloca resTy Nothing Nothing) pft0
+        (lf,pff0) = closeBlock
+                  $ addEffect (LLVM.Jump lk)
+                  $ addEffect (LLVM.Store t (resPtr rt) Nothing) pft1
+
+        (rf,pff1) = newResult (LLVM.Alloca resTy Nothing Nothing) pff0
+        (lk,pf')  = closeBlock
+                  $ addEffect (LLVM.Jump lk)
+                  $ addEffect (LLVM.Store f (resPtr rf) Nothing) pff1
+
+     in addResult resVal (LLVM.Phi resTy [ (LLVM.ValIdent rt, lt)
+                                         , (LLVM.ValIdent rf, lf) ]) pf'
+
+  UNeg | [a] <- args ->
+      let zero = const (LLVM.ValInteger 0) `fmap` a
+          kind = kindOf (head sws)
+       in addResult resVal (llvmBinOp Minus kind zero (LLVM.typedValue a)) pf
+
+      -- binary operators
+  _ | op `elem` [ Plus, Times, Minus, Quot, Rem, Equal, NotEqual, LessThan
+                , GreaterThan ]
+    , [a,b] <- args ->
+      let kind = kindOf (head sws)
+       in addResult resVal (llvmBinOp op kind a (LLVM.typedValue b)) pf
+
+  _ -> die $ "Received operator " ++ show op ++ " applied to " ++ show sws
 
   where
 
-  resTy  = llvmType (kindOf res)
-  resVal = LLVM.Ident (show res)
+  resTy    = llvmType (kindOf res)
+  resPtr p = LLVM.Typed (LLVM.PtrTo resTy) (LLVM.ValIdent p)
+  resVal   = LLVM.Ident (show res)
 
+  args = map swValue sws
 
-toInstr :: SBVExpr -> LLVM.Instr
-toInstr (SBVApp op sws) = case op of
+isFloating :: Kind -> Bool
+isFloating KFloat  = True
+isFloating KDouble = True
+isFloating _       = False
 
-  Plus | [a,b] <- args -> LLVM.Arith (LLVM.Add False False) a (LLVM.typedValue b)
+isSigned :: Kind -> Bool
+isSigned (KBounded s _) = s
+isSigned k              = die ("isSigned: unexpected kind: " ++ show k)
 
-  where
+llvmBinOp :: Op -> Kind -> LLVM.Typed LLVM.Value -> LLVM.Value -> LLVM.Instr
+llvmBinOp Plus  k | isFloating k = LLVM.Arith  LLVM.FAdd
+                  | otherwise    = LLVM.Arith (LLVM.Add False False)
+llvmBinOp Minus k | isFloating k = LLVM.Arith  LLVM.FSub
+                  | otherwise    = LLVM.Arith (LLVM.Sub False False)
+llvmBinOp Times k | isFloating k = LLVM.Arith  LLVM.FMul
+                  | otherwise    = LLVM.Arith (LLVM.Mul False False)
 
-  args = map toTyped sws
+llvmBinOp Quot  k | isFloating k = LLVM.Arith  LLVM.FDiv
+                  | isSigned   k = LLVM.Arith (LLVM.SDiv False)
+                  | otherwise    = LLVM.Arith (LLVM.UDiv False)
 
-  toTyped sw =
-    LLVM.Typed { LLVM.typedValue = LLVM.ValIdent (LLVM.Ident (show sw))
-               , LLVM.typedType  = llvmType (kindOf sw) }
+llvmBinOp Rem   k | isFloating k = LLVM.Arith  LLVM.FRem
+                  | isSigned   k = LLVM.Arith  LLVM.SRem
+                  | otherwise    = LLVM.Arith  LLVM.URem
+
+llvmBinOp Equal k | isFloating k = LLVM.FCmp LLVM.Foeq
+                  | otherwise    = LLVM.ICmp LLVM.Ieq
+
+llvmBinOp NotEqual k | isFloating k = LLVM.FCmp LLVM.Fone
+                     | otherwise    = LLVM.ICmp LLVM.Ine
+
+llvmBinOp LessThan k | isFloating k = LLVM.FCmp LLVM.Folt
+                     | otherwise    = LLVM.ICmp LLVM.Iult
+
+llvmBinOp GreaterThan k | isFloating k = LLVM.FCmp LLVM.Fogt
+                        | otherwise    = LLVM.ICmp LLVM.Iugt
