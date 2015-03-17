@@ -49,7 +49,7 @@ Library
   Build-Depends   : base >= 4 && < 5
                   , array, async, containers, deepseq, directory, filepath, old-time
                   , pretty, process, mtl, QuickCheck, random, syb
-                  , llvm-pretty
+                  , llvm-pretty >= 0.3.1.1
   Exposed-modules : Data.SBV
                   , Data.SBV.Bridge.Boolector
                   , Data.SBV.Bridge.CVC4

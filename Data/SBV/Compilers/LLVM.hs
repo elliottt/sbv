@@ -6,7 +6,9 @@ import Data.SBV.Compilers.CodeGen
 
 import qualified Data.Foldable as F
 import qualified Data.Sequence as Seq
+import           Data.String (IsString(..))
 import           System.Random (randoms,newStdGen)
+import           Text.LLVM hiding (Result)
 import qualified Text.LLVM.AST as LLVM
 import           Text.PrettyPrint.HughesPJ (render)
 
@@ -50,27 +52,24 @@ cgen cfg nm st sbvProg = result
 
   -- TODO: revisit this use of cgInteger and cgReal
   result = CgPgmBundle (cgInteger cfg, cgReal cfg)
-      [ ( nm ++ ".ll", (CgSource, [LLVM.ppDefine def]))
+      [ ( nm ++ ".ll", (CgSource, [LLVM.ppModule m]))
       ]
 
-  def = LLVM.Define { LLVM.defAttrs   = LLVM.emptyFunAttrs
-                    , LLVM.defRetType = ret
-                    , LLVM.defName    = LLVM.Symbol nm
-                    , LLVM.defArgs    = args
-                    , LLVM.defVarArgs = False
-                    , LLVM.defSection = Nothing
-                    , LLVM.defBody    = [body] }
+  (_,m) = runLLVM $
+    do _ <- define' emptyFunAttrs rty (fromString nm) args False $ \ as ->
+              do genLLVMProg sbvProg (zip as (cgInputs st))
+                 end
 
-  body = genLLVMProg sbvProg end
+       return ()
 
-  (ret,end) =
+  (rty,end) =
     case cgReturns st of
 
-      [] -> (LLVM.PrimType LLVM.Void, Nothing)
+      [] -> (voidT, retVoid)
 
       [CgAtomic o] ->
         let ty = llvmType (kindOf o)
-         in (ty, Just (LLVM.Typed ty (LLVM.ValIdent ((LLVM.Ident (show o))))))
+         in (ty, ret (ty =: LLVM.Ident (show o)))
 
       [CgArray _]  -> tbd "Non-atomic return values"
 
@@ -79,17 +78,13 @@ cgen cfg nm st sbvProg = result
   args = map mkParam (cgInputs st)
 
 -- | Generate parameters for an LLVM function.
-mkParam :: (String,CgVal) -> LLVM.Typed LLVM.Ident
-mkParam (name, val) =
-  LLVM.Typed { LLVM.typedValue = LLVM.Ident name
-             , LLVM.typedType  = ty
-             }
-  where
-  ty = case val of
-         CgAtomic o       -> llvmType (kindOf o)
-         CgArray os@(o:_) -> LLVM.Array (fromIntegral (length os))
-                                        (llvmType (kindOf o))
-         CgArray _        -> die "mkParam: CgArray with no elements!"
+mkParam :: (String,CgVal) -> Type
+mkParam (_, val) =
+  case val of
+    CgAtomic o       -> llvmType (kindOf o)
+    CgArray os@(o:_) -> ptrT (arrayT (fromIntegral (length os))
+                                     (llvmType (kindOf o)))
+    CgArray _        -> die "mkParam: CgArray with no elements!"
 
 
 -- | Translate from SBV Kinds to LLVM Types.
@@ -103,48 +98,66 @@ llvmType KReal          = error "llvmType: KReal"
 llvmType KUserSort{}    = error "llvmType: KUserSort"
 
 
-genLLVMProg :: Result -> Maybe (LLVM.Typed LLVM.Value) -> LLVM.BasicBlock
+genLLVMProg :: Result -> [(Typed Value, (String,CgVal))] -> BB ()
 genLLVMProg
   (Result kindInfo _tvals cgs ins preConsts tbls arrs _ _ (SBVPgm asgns) cstrs _)
-  resVar
-  = block
+  args
+  = do mapM_ rnArg args
+       mapM_ mkConst preConsts
+       F.mapM_ toStmt asgns
   where
 
-  block =
-    LLVM.BasicBlock { LLVM.bbLabel = Nothing
-                    , LLVM.bbStmts = toStmts asgns ++ [retStmt] }
+  rnArg (tv,(var,CgAtomic i)) =
+    assign (fromString (show i)) (add tv (0 :: Integer))
 
-  retStmt =
-    case resVar of
-      Just var -> LLVM.Effect (LLVM.Ret var) []
-      Nothing  -> LLVM.Effect LLVM.RetVoid   []
+  rnArg (_,(_,CgArray [])) =
+    die "genLLVMProg: CgArray with no elements"
 
-toStmts :: Seq.Seq (SW,SBVExpr) -> [LLVM.Stmt]
-toStmts asgns = [ LLVM.Result (LLVM.Ident (show sw)) (toInstr e) []
-                | (sw,e) <- F.toList asgns ]
+  -- rnArg (var,CgArray is) = concat (zipWith index [0 .. ] is)
+  --     where
+  --     index = LLVM.GEP True 
 
-swValue :: SW -> LLVM.Typed LLVM.Value
-swValue sw =
-  LLVM.Typed { LLVM.typedType  = llvmType (kindOf sw)
-             , LLVM.typedValue = LLVM.ValIdent (LLVM.Ident (show sw)) }
+cwValue :: CW -> LLVM.Typed LLVM.Value
+cwValue (CW kind val) =
+  case val of
+    CWInteger i -> mk (toValue   i)
+    CWFloat   f -> mk (ValFloat  f)
+    CWDouble  d -> mk (ValDouble d)
+    _           -> die "cwValue: unhandled value"
 
-toInstr :: SBVExpr -> LLVM.Instr
-toInstr (SBVApp op sws) = case op of
+  where
+
+  mk = LLVM.Typed (llvmType kind)
+
+swValue :: SW -> Typed Value
+swValue sw = llvmType (kindOf sw) -: Ident (show sw)
+
+mkConst :: (SW,CW) -> BB (Typed Value)
+mkConst (res,cw) =
+  assign (fromString (show res))
+         (llvmBinOp Plus (kindOf cw) cwVal zero)
+  where
+  cwVal = cwValue cw
+  zero  = const (toValue (0 :: Integer)) `fmap` cwVal
+
+
+toStmt :: (SW,SBVExpr) -> BB (Typed Value)
+toStmt (res,SBVApp op sws) = case op of
 
   Ite | [c,t,f] <- args ->
-    LLVM.Select c t (LLVM.typedValue f)
+    assign (fromString (show res)) (select c t f)
 
   UNeg | [a] <- args ->
       let zero = const (LLVM.ValInteger 0) `fmap` a
           kind = kindOf (head sws)
-       in llvmBinOp Minus kind zero (LLVM.typedValue a)
+       in assign (fromString (show res)) (llvmBinOp Minus kind zero a)
 
       -- binary operators
   _ | op `elem` [ Plus, Times, Minus, Quot, Rem, Equal, NotEqual, LessThan
                 , GreaterThan ]
     , [a,b] <- args ->
       let kind = kindOf (head sws)
-       in llvmBinOp op kind a (LLVM.typedValue b)
+       in assign (fromString (show res)) (llvmBinOp op kind a b)
 
   _ -> die $ "Received operator " ++ show op ++ " applied to " ++ show sws
 
@@ -161,30 +174,30 @@ isSigned :: Kind -> Bool
 isSigned (KBounded s _) = s
 isSigned k              = die ("isSigned: unexpected kind: " ++ show k)
 
-llvmBinOp :: Op -> Kind -> LLVM.Typed LLVM.Value -> LLVM.Value -> LLVM.Instr
-llvmBinOp Plus  k | isFloating k = LLVM.Arith  LLVM.FAdd
-                  | otherwise    = LLVM.Arith (LLVM.Add False False)
-llvmBinOp Minus k | isFloating k = LLVM.Arith  LLVM.FSub
-                  | otherwise    = LLVM.Arith (LLVM.Sub False False)
-llvmBinOp Times k | isFloating k = LLVM.Arith  LLVM.FMul
-                  | otherwise    = LLVM.Arith (LLVM.Mul False False)
+llvmBinOp :: Op -> Kind -> Typed Value -> Typed Value -> BB (Typed Value)
+llvmBinOp Plus  k | isFloating k = fadd
+                  | otherwise    = add
+llvmBinOp Minus k | isFloating k = fsub
+                  | otherwise    = sub
+llvmBinOp Times k | isFloating k = fmul
+                  | otherwise    = mul
 
-llvmBinOp Quot  k | isFloating k = LLVM.Arith  LLVM.FDiv
-                  | isSigned   k = LLVM.Arith (LLVM.SDiv False)
-                  | otherwise    = LLVM.Arith (LLVM.UDiv False)
+llvmBinOp Quot  k | isFloating k = fdiv
+                  | isSigned   k = sdiv
+                  | otherwise    = udiv
 
-llvmBinOp Rem   k | isFloating k = LLVM.Arith  LLVM.FRem
-                  | isSigned   k = LLVM.Arith  LLVM.SRem
-                  | otherwise    = LLVM.Arith  LLVM.URem
+llvmBinOp Rem   k | isFloating k = frem
+                  | isSigned   k = srem
+                  | otherwise    = urem
 
-llvmBinOp Equal k | isFloating k = LLVM.FCmp LLVM.Foeq
-                  | otherwise    = LLVM.ICmp LLVM.Ieq
+llvmBinOp Equal k | isFloating k = fcmp Foeq
+                  | otherwise    = icmp Ieq
 
-llvmBinOp NotEqual k | isFloating k = LLVM.FCmp LLVM.Fone
-                     | otherwise    = LLVM.ICmp LLVM.Ine
+llvmBinOp NotEqual k | isFloating k = fcmp Fone
+                     | otherwise    = icmp Ine
 
-llvmBinOp LessThan k | isFloating k = LLVM.FCmp LLVM.Folt
-                     | otherwise    = LLVM.ICmp LLVM.Iult
+llvmBinOp LessThan k | isFloating k = fcmp Folt
+                     | otherwise    = icmp Iult
 
-llvmBinOp GreaterThan k | isFloating k = LLVM.FCmp LLVM.Fogt
-                        | otherwise    = LLVM.ICmp LLVM.Iugt
+llvmBinOp GreaterThan k | isFloating k = fcmp Fogt
+                        | otherwise    = icmp Iugt
