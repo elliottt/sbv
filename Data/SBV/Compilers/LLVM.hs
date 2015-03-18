@@ -1,3 +1,5 @@
+{-# LANGUAGE RecordWildCards #-}
+
 module Data.SBV.Compilers.LLVM where
 
 import Data.SBV.BitVectors.Data
@@ -8,8 +10,7 @@ import qualified Data.Foldable as F
 import qualified Data.Sequence as Seq
 import           Data.String (IsString(..))
 import           System.Random (randoms,newStdGen)
-import           Text.LLVM hiding (Result)
-import qualified Text.LLVM.AST as LLVM
+import           Text.LLVM hiding (Result,And,Or)
 import           Text.PrettyPrint.HughesPJ (render)
 
 
@@ -46,18 +47,33 @@ instance CgTarget SBVToLLVM where
   targetName _ = "LLVM"
   translate _  = cgen
 
+floatT  = PrimType (FloatType Float)
+doubleT = PrimType (FloatType Double)
+
+data Intrinsics = Intrinsics { llvm_fabs_f32 :: Typed Value
+                             , llvm_fabs_f64 :: Typed Value
+                             }
+
+-- | Declare intrinsics used by SBV.
+declareIntrinsics :: LLVM Intrinsics
+declareIntrinsics  =
+  do llvm_fabs_f32 <- declare floatT  "llvm.fabs.f32" [ floatT] False
+     llvm_fabs_f64 <- declare doubleT "llvm.fabs.f64" [doubleT] False
+     return Intrinsics { .. }
+
 cgen :: CgConfig -> String -> CgState -> Result -> CgPgmBundle
 cgen cfg nm st sbvProg = result
   where
 
   -- TODO: revisit this use of cgInteger and cgReal
   result = CgPgmBundle (cgInteger cfg, cgReal cfg)
-      [ ( nm ++ ".ll", (CgSource, [LLVM.ppModule m]))
+      [ ( nm ++ ".ll", (CgSource, [ppModule m]))
       ]
 
   (_,m) = runLLVM $
-    do _ <- define' emptyFunAttrs rty (fromString nm) args False $ \ as ->
-              do genLLVMProg sbvProg (zip as (cgInputs st))
+    do ints <- declareIntrinsics
+       _ <- define' emptyFunAttrs rty (fromString nm) args False $ \ as ->
+              do genLLVMProg ints sbvProg (zip as (cgInputs st))
                  end
 
        return ()
@@ -69,7 +85,7 @@ cgen cfg nm st sbvProg = result
 
       [CgAtomic o] ->
         let ty = llvmType (kindOf o)
-         in (ty, ret (ty =: LLVM.Ident (show o)))
+         in (ty, ret (ty =: Ident (show o)))
 
       [CgArray _]  -> tbd "Non-atomic return values"
 
@@ -88,36 +104,35 @@ mkParam (_, val) =
 
 
 -- | Translate from SBV Kinds to LLVM Types.
-llvmType :: Kind -> LLVM.Type
-llvmType KBool          = LLVM.PrimType (LLVM.Integer 1)
-llvmType (KBounded s w) = LLVM.PrimType (LLVM.Integer (fromIntegral w))
-llvmType KFloat         = LLVM.PrimType (LLVM.FloatType LLVM.Float)
-llvmType KDouble        = LLVM.PrimType (LLVM.FloatType LLVM.Double)
+llvmType :: Kind -> Type
+llvmType KBool          = PrimType (Integer 1)
+llvmType (KBounded s w) = PrimType (Integer (fromIntegral w))
+llvmType KFloat         = PrimType (FloatType Float)
+llvmType KDouble        = PrimType (FloatType Double)
 llvmType KUnbounded     = error "llvmType: KUnbounded"
 llvmType KReal          = error "llvmType: KReal"
 llvmType KUserSort{}    = error "llvmType: KUserSort"
 
 
-genLLVMProg :: Result -> [(Typed Value, (String,CgVal))] -> BB ()
-genLLVMProg
+genLLVMProg :: Intrinsics -> Result -> [(Typed Value, (String,CgVal))] -> BB ()
+genLLVMProg ints
   (Result kindInfo _tvals cgs ins preConsts tbls arrs _ _ (SBVPgm asgns) cstrs _)
   args
   = do mapM_ rnArg args
-       mapM_ mkConst preConsts
-       F.mapM_ toStmt asgns
+       F.mapM_ (toStmt ints preConsts) asgns
   where
 
   rnArg (tv,(var,CgAtomic i)) =
-    assign (fromString (show i)) (add tv (0 :: Integer))
+    assign (fromString (show i)) (add tv (int 0))
 
   rnArg (_,(_,CgArray [])) =
     die "genLLVMProg: CgArray with no elements"
 
   -- rnArg (var,CgArray is) = concat (zipWith index [0 .. ] is)
   --     where
-  --     index = LLVM.GEP True 
+  --     index = GEP True 
 
-cwValue :: CW -> LLVM.Typed LLVM.Value
+cwValue :: CW -> Typed Value
 cwValue (CW kind val) =
   case val of
     CWInteger i -> mk (toValue   i)
@@ -127,43 +142,63 @@ cwValue (CW kind val) =
 
   where
 
-  mk = LLVM.Typed (llvmType kind)
+  mk = Typed (llvmType kind)
 
-swValue :: SW -> Typed Value
-swValue sw = llvmType (kindOf sw) -: Ident (show sw)
+swValue :: [(SW,CW)] -> SW -> Typed Value
+swValue consts sw
+  | sw == falseSW                 = mkTyped sw False
+  | sw == trueSW                  = mkTyped sw True
+  | Just cw <- sw `lookup` consts = mkConst cw
+  | otherwise                     = mkTyped sw (Ident (show sw))
 
-mkConst :: (SW,CW) -> BB (Typed Value)
-mkConst (res,cw) =
-  assign (fromString (show res))
-         (llvmBinOp Plus (kindOf cw) cwVal zero)
-  where
-  cwVal = cwValue cw
-  zero  = const (toValue (0 :: Integer)) `fmap` cwVal
+mkTyped :: (HasKind kind, IsValue a) => kind -> a -> Typed Value
+mkTyped kind a = llvmType (kindOf kind) -: a
 
+mkConst :: CW -> Typed Value
+mkConst (CW KFloat           (CWFloat   f)) = llvmType KFloat  -: f
+mkConst (CW KDouble          (CWDouble  f)) = llvmType KDouble -: f
+mkConst (CW k@(KBounded s w) (CWInteger i)) = llvmType k       -: i
 
-toStmt :: (SW,SBVExpr) -> BB (Typed Value)
-toStmt (res,SBVApp op sws) = case op of
+assignSW :: SW -> BB (Typed Value) -> BB (Typed Value)
+assignSW sw = assign (Ident (show sw))
+
+toStmt :: Intrinsics -> [(SW,CW)] -> (SW,SBVExpr) -> BB (Typed Value)
+toStmt ints consts (res,SBVApp op sws) = assignSW res $ case op of
 
   Ite | [c,t,f] <- args ->
-    assign (fromString (show res)) (select c t f)
+    select c t f
 
   UNeg | [a] <- args ->
-      let zero = const (LLVM.ValInteger 0) `fmap` a
+      let zero = const (ValInteger 0) `fmap` a
           kind = kindOf (head sws)
-       in assign (fromString (show res)) (llvmBinOp Minus kind zero a)
+       in llvmBinOp Minus kind (const (int 0) `fmap` a) a
+
+  Abs | [a] <- args ->
+    case kindOf (head sws) of
+      KFloat           -> call (llvm_fabs_f32 ints) [a]
+      KDouble          -> call (llvm_fabs_f64 ints) [a]
+      KBounded False _ -> return a
+      KBounded True  w -> do cond <- icmp Isgt a      (int 0)
+                             a'   <- bxor a           (int (negate 1))
+                             select cond a =<< add a' (int 1)
+      kind             -> fail ("toStmt: unsupported kind for abs: " ++ show kind)
+
+  -- Not is only ever used with i1
+  Not | [a] <- args ->
+    bxor a (1 :: Int)
 
       -- binary operators
   _ | op `elem` [ Plus, Times, Minus, Quot, Rem, Equal, NotEqual, LessThan
-                , GreaterThan ]
+                , GreaterThan, And, Or ]
     , [a,b] <- args ->
       let kind = kindOf (head sws)
-       in assign (fromString (show res)) (llvmBinOp op kind a b)
+       in llvmBinOp op kind a b
 
   _ -> die $ "Received operator " ++ show op ++ " applied to " ++ show sws
 
   where
 
-  args = map swValue sws
+  args = map (swValue consts) sws
 
 isFloating :: Kind -> Bool
 isFloating KFloat  = True
@@ -174,7 +209,7 @@ isSigned :: Kind -> Bool
 isSigned (KBounded s _) = s
 isSigned k              = die ("isSigned: unexpected kind: " ++ show k)
 
-llvmBinOp :: Op -> Kind -> Typed Value -> Typed Value -> BB (Typed Value)
+llvmBinOp :: IsValue a => Op -> Kind -> Typed Value -> a -> BB (Typed Value)
 llvmBinOp Plus  k | isFloating k = fadd
                   | otherwise    = add
 llvmBinOp Minus k | isFloating k = fsub

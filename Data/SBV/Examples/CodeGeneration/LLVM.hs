@@ -5,5 +5,5 @@ import Data.SBV
 
 test = compileToLLVM Nothing "foo" $
   do x <- cgInput "x"
-     let f a = ite (a .> 10) (a + 10) (a - (10 :: SWord8))
+     let f a = ite (bnot (a .> 10)) (a + 10) (abs (a - (10 :: SInt32)))
      cgReturn (f x)
