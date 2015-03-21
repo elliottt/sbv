@@ -134,10 +134,13 @@ genLLVMProg env0 ints
   rnArg _ (_,(_,CgArray [])) =
     die "genLLVMProg: CgArray with no elements"
 
-  -- unload each entry, adding a mapping in the const map for each.
-  -- rnArg (var,CgArray is) = concat (zipWith index [0 .. ] is)
-  --     where
-  --     index = GEP True 
+  rnArg cs (arg,(_,CgArray is)) =
+    do arr <- load arg Nothing
+       foldM (unpackArg arr) cs (zip [0 .. ] is)
+
+  unpackArg arr cs (off,i) =
+    do tv <- extractValue arr off
+       return (bindValue i tv cs)
 
 
 -- Environment -----------------------------------------------------------------
