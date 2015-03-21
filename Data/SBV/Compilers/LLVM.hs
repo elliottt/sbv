@@ -12,7 +12,7 @@ import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
 import           Data.String (IsString(..))
 import           System.Random (randoms,newStdGen)
-import           Text.LLVM hiding (Result,And,Or,Xor)
+import           Text.LLVM hiding (Result,And,Or,Xor,Shl,Shr)
 import           Text.PrettyPrint.HughesPJ (render)
 
 
@@ -74,11 +74,14 @@ cgen cfg nm st sbvProg = result
 
   (_,m) = runLLVM $
     do ints <- declareIntrinsics
+       env  <- bindUninterpreted us emptyEnv
        _ <- define' emptyFunAttrs rty (fromString nm) args False $ \ as ->
-              do env <- genLLVMProg ints sbvProg (zip as (cgInputs st))
+              do env <- genLLVMProg env ints sbvProg (zip as (cgInputs st))
                  end env
 
        return ()
+
+  Result _ _ _ _ _ _ _ us _ _ _ _ = sbvProg
 
   (rty,end) =
     case cgReturns st of
@@ -114,20 +117,19 @@ llvmType KReal          = error "llvmType: KReal"
 llvmType KUserSort{}    = error "llvmType: KUserSort"
 
 
-genLLVMProg :: Intrinsics -> Result -> [(Typed Value, (String,CgVal))] -> BB Env
-genLLVMProg ints
-  (Result kindInfo _tvals cgs ins preConsts tbls arrs _ _ (SBVPgm asgns) cstrs _)
+genLLVMProg :: Env -> Intrinsics -> Result -> [(Typed Value, (String,CgVal))]
+            -> BB Env
+genLLVMProg env0 ints
+  (Result kindInfo _ cgs ins preConsts tbls arrs us _ (SBVPgm asgns) cstrs _)
   args
-  = do env' <- foldM rnArg env args
-       F.foldlM (toStmt ints) env' asgns
+  = do let env1 = bindConsts preConsts env0
+       env2 <- foldM rnArg env1 args
+       F.foldlM (toStmt ints) env2 asgns
   where
-
-  -- the initial environment, just containing mappings to constants
-  env = Map.fromList [ (sw, cwValue cw) | (sw,cw) <- preConsts ]
 
   -- add entries in the environment for mappings to arguments
   rnArg cs (tv,(_,CgAtomic i)) =
-    return (Map.insert i tv cs)
+    return (bindValue i tv cs)
 
   rnArg _ (_,(_,CgArray [])) =
     die "genLLVMProg: CgArray with no elements"
@@ -137,8 +139,54 @@ genLLVMProg ints
   --     where
   --     index = GEP True 
 
+
+-- Environment -----------------------------------------------------------------
+
 -- | The mapping from names in SBV to names in the generated assembly.
-type Env = Map.Map SW (Typed Value)
+data Env = Env { envValues        :: Map.Map SW (Typed Value)
+               , envUninterpreted :: Map.Map String (Typed Value)
+               }
+
+emptyEnv :: Env
+emptyEnv  = Env { envValues = Map.empty, envUninterpreted = Map.empty }
+
+bindConsts :: [(SW,CW)] -> Env -> Env
+bindConsts cs Env { .. } = Env { envValues = Map.union new envValues, .. }
+  where
+  new = Map.fromList [ (sw, cwValue cw) | (sw,cw) <- cs ]
+
+-- | Bind uninterpreted constants, and declare them in the resulting module.
+bindUninterpreted :: [(String,SBVType)] -> Env -> LLVM Env
+bindUninterpreted us Env { .. } =
+  do new <- foldM addDec envUninterpreted us
+     return Env { envUninterpreted = new, .. }
+  where
+
+  -- a global variable
+  addDec env (n, SBVType [t]) =
+    do let attrs = GlobalAttrs { gaLinkage  = Just External
+                               , gaConstant = True }
+       tv <- global attrs (Symbol n) (llvmType t) Nothing
+       return (Map.insert n tv env)
+
+
+  mkTy [t] = llvmType t
+  mkTy []  = die "bindUninterpreted: Invalid SBVType"
+  mkTy ts  = PtrTo (FunTy (llvmType ret) (map llvmType args) False)
+    where
+    (args,[ret]) = splitAt (length ts - 1) ts
+
+bindValue :: SW -> Typed Value -> Env -> Env
+bindValue sw tv Env { .. } = Env { envValues = Map.insert sw tv envValues, .. }
+
+lookupSW :: SW -> Env -> Maybe (Typed Value)
+lookupSW sw Env { .. } = Map.lookup sw envValues
+
+lookupUninterpreted :: String -> Env -> Maybe (Typed Value)
+lookupUninterpreted n Env { .. } = Map.lookup n envUninterpreted
+
+
+-- Values ----------------------------------------------------------------------
 
 cwValue :: CW -> Typed Value
 cwValue (CW kind val) =
@@ -154,10 +202,10 @@ cwValue (CW kind val) =
 
 swValue :: Env -> SW -> Typed Value
 swValue env sw
-  | sw == falseSW                  = mkTyped sw False
-  | sw == trueSW                   = mkTyped sw True
-  | Just tv <- sw `Map.lookup` env = tv
-  | otherwise                      = mkTyped sw (Ident (show sw))
+  | sw == falseSW                = mkTyped sw False
+  | sw == trueSW                 = mkTyped sw True
+  | Just tv <- sw `lookupSW` env = tv
+  | otherwise                    = mkTyped sw (Ident (show sw))
 
 mkTyped :: (HasKind kind, IsValue a) => kind -> a -> Typed Value
 mkTyped kind a = llvmType (kindOf kind) -: a
@@ -167,13 +215,13 @@ mkConst (CW KFloat           (CWFloat   f)) = llvmType KFloat  -: f
 mkConst (CW KDouble          (CWDouble  f)) = llvmType KDouble -: f
 mkConst (CW k@(KBounded s w) (CWInteger i)) = llvmType k       -: i
 
-assignSW :: SW -> BB (Typed Value) -> BB (Typed Value)
-assignSW sw = assign (Ident (show sw))
+
+-- Statements ------------------------------------------------------------------
 
 toStmt :: Intrinsics -> Env -> (SW,SBVExpr) -> BB Env
 toStmt ints env (res,SBVApp op sws) =
   do val <- stmts
-     return (Map.insert res val env)
+     return (bindValue res val env)
 
   where
   stmts = case op of
@@ -200,12 +248,51 @@ toStmt ints env (res,SBVApp op sws) =
     Not | [a] <- args ->
       bxor a (1 :: Int)
 
+    -- shift left
+    Shl n | [a] <- args ->
+      shl a (n :: Int)
+
+    -- shift right
+    Shr n | [a] <- args ->
+      case kindOf (head sws) of
+        KBounded True  _ -> ashr a (n :: Int)
+        KBounded False _ -> lshr a (n :: Int)
+        k                -> die $ "Unsupported kind to Shr: " ++ show k
+
+    Extract i j -> tbd "Extract"
+
+    -- join is only ever called with unsigned arguments
+    Join | [a,b] <- args ->
+      case map kindOf sws of
+        [ KBounded False la, KBounded False lb ] ->
+          do let ty = iT (fromIntegral (la + lb))
+             a'  <- zext a ty
+             b'  <- zext b ty
+             a'' <- shl a' lb
+             band a'' b'
+
+        _ -> die $ "Join applied to " ++ show sws
+
+    ArrEq   _ _ -> tbd "User specified arrays (ArrEq)"
+    ArrRead _   -> tbd "User specified arrays (ArrRead)"
+
+    Uninterpreted s
+      | Just tv <- lookupUninterpreted s env ->
+        if null args
+           then load tv Nothing
+           else call tv args
+
+      | otherwise ->
+        die ("Unknown uninterpreted constant: " ++ s)
+
         -- binary operators
     _ | op `elem` [ Plus, Times, Minus, Quot, Rem, Equal, NotEqual, LessThan
                   , GreaterThan, And, Or, XOr ]
       , [a,b] <- args ->
         let kind = kindOf (head sws)
          in llvmBinOp op kind a b
+
+    FPRound str -> tbd "FPRound"
 
     _ -> die $ "Received operator " ++ show op ++ " applied to " ++ show sws
 
