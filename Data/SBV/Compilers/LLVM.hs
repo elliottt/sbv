@@ -162,7 +162,6 @@ bindUninterpreted us Env { .. } =
      return Env { envUninterpreted = new, .. }
   where
 
-  -- a global variable
   addDec env (n, SBVType ts) = case ts of
 
     []  -> die "bindUninterpreted: Invalid SBVType"
