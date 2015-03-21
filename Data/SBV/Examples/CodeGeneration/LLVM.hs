@@ -10,6 +10,6 @@ test = compileToLLVM Nothing "foo" $
            let r = ite (bnot (a .> 10))
                      (((a + 32) `shiftL` 10) `shiftR` 20)
                      (abs (a - (10 :: SWord32)))
-            in (bar + (r # r)) :: SWord64
+            in (bar r + (r # r)) :: SWord64
 
      cgReturn (f x)

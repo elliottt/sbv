@@ -163,18 +163,19 @@ bindUninterpreted us Env { .. } =
   where
 
   -- a global variable
-  addDec env (n, SBVType [t]) =
-    do let attrs = GlobalAttrs { gaLinkage  = Just External
-                               , gaConstant = True }
-       tv <- global attrs (Symbol n) (llvmType t) Nothing
-       return (Map.insert n tv env)
+  addDec env (n, SBVType ts) = case ts of
 
+    []  -> die "bindUninterpreted: Invalid SBVType"
 
-  mkTy [t] = llvmType t
-  mkTy []  = die "bindUninterpreted: Invalid SBVType"
-  mkTy ts  = PtrTo (FunTy (llvmType ret) (map llvmType args) False)
-    where
-    (args,[ret]) = splitAt (length ts - 1) ts
+    [t] -> do let attrs = GlobalAttrs { gaLinkage  = Just External
+                                      , gaConstant = True }
+              tv <- global attrs (Symbol n) (llvmType t) Nothing
+              return (Map.insert n tv env)
+
+    _   -> do let (args,[ret]) = splitAt (length ts - 1) ts
+              tv <- declare (llvmType ret) (Symbol n) (map llvmType args) False
+              return (Map.insert n tv env)
+
 
 bindValue :: SW -> Typed Value -> Env -> Env
 bindValue sw tv Env { .. } = Env { envValues = Map.insert sw tv envValues, .. }
