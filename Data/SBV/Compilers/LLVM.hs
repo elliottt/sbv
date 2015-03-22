@@ -304,7 +304,7 @@ toStmt ints env (res,SBVApp op sws) =
              a'  <- zext a ty
              b'  <- zext b ty
              a'' <- shl a' lb
-             band a'' b'
+             bor a'' b'
 
         _ -> die $ "Join applied to " ++ show sws
 
