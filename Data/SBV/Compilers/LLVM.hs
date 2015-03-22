@@ -279,7 +279,22 @@ toStmt ints env (res,SBVApp op sws) =
                            l <- lshr a n
                            bor u l
 
-    Extract i j -> tbd "Extract"
+    -- sizeof a > i >= j >= 0
+    Extract i j | [a] <- args ->
+
+      case (kindOf (head sws), kindOf res) of
+
+        (KBounded False m, KBounded False n)
+          | n == i - j + 1 ->
+            do val <- if j > 0 then lshr a j
+                               else return a
+
+               if m > n
+                  then trunc val (iT (fromIntegral n))
+                  else return val
+
+        _ -> die ("Malformed Extract: " ++ show op ++ " " ++ show sws)
+
 
     -- join is only ever called with unsigned arguments
     Join | [a,b] <- args ->

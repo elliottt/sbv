@@ -4,12 +4,17 @@ import Data.SBV
 
 
 test = compileToLLVM Nothing "foo" $
-  do arr <- cgInputArr 2 "x"
-     let bar = uninterpret "bar"
-     let f [a,b] =
-           let r = ite (bnot (a .> 10))
-                     (((a + 32) `shiftL` 10) `shiftR` 20)
-                     (abs (a - (10 :: SWord32)))
-            in rotateR ((bar b + (r # r)) :: SWord64) 10
+  do x <- cgInput "x"
+     y <- cgInput "y"
 
-     cgReturn (f arr)
+     let f :: SWord32 -> SWord32 -> SWord32
+         f a b =
+           let w :: SWord64
+               w  = a # b
+
+               h,l :: SWord32
+               (h,l) = split w
+
+            in snd (split (l # h))
+
+     cgReturn (f x y)
