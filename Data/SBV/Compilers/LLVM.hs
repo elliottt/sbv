@@ -1,6 +1,9 @@
 {-# LANGUAGE RecordWildCards #-}
 
-module Data.SBV.Compilers.LLVM where
+module Data.SBV.Compilers.LLVM (
+  compileToLLVM,
+  compileToLLVM'
+  ) where
 
 import Data.SBV.BitVectors.Data
 import Data.SBV.BitVectors.PrettyNum (shex, showCFloat, showCDouble)
@@ -253,7 +256,7 @@ toStmt ints env (res,SBVApp op sws) =
 
     -- shift left
     Shl n | [a] <- args ->
-      shl a (n :: Int)
+      shl a n
 
     -- shift right
     Shr n | [a] <- args ->
@@ -261,6 +264,20 @@ toStmt ints env (res,SBVApp op sws) =
         KBounded True  _ -> ashr a (n :: Int)
         KBounded False _ -> lshr a (n :: Int)
         k                -> die $ "Unsupported kind to Shr: " ++ show k
+
+    -- rotate left
+    Rol n | [a] <- args ->
+      case kindOf (head sws) of
+        KBounded _ w -> do u <- shl a n
+                           l <- lshr a (w - n)
+                           bor u l
+        _            -> die "Invalid arguments to Rol"
+
+    Ror n | [a] <- args ->
+      case kindOf (head sws) of
+        KBounded _ w -> do u <- shl  a (w - n)
+                           l <- lshr a n
+                           bor u l
 
     Extract i j -> tbd "Extract"
 
