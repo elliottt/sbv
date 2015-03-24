@@ -9,7 +9,7 @@ import Data.SBV.BitVectors.Data
 import Data.SBV.BitVectors.PrettyNum (shex, showCFloat, showCDouble)
 import Data.SBV.Compilers.CodeGen
 
-import           Control.Monad (foldM)
+import           Control.Monad (foldM,zipWithM_)
 import qualified Data.Foldable as F
 import qualified Data.Map.Strict as Map
 import qualified Data.Sequence as Seq
@@ -78,8 +78,10 @@ cgen cfg nm st sbvProg = result
   (_,m) = runLLVM $
     do ints <- declareIntrinsics
        env  <- bindUninterpreted us emptyEnv
-       _ <- define' emptyFunAttrs rty (fromString nm) args False $ \ as ->
-              do env <- genLLVMProg env ints sbvProg (zip as (cgInputs st))
+       _ <- define' emptyFunAttrs rty (fromString nm) (ins ++ outs) False $ \ as ->
+              do let (is,os) = splitAt (length ins) as
+                 env <- genLLVMProg env ints sbvProg (zip is (cgInputs  st))
+                                                     (zip os (cgOutputs st))
                  end env
 
        return ()
@@ -97,16 +99,26 @@ cgen cfg nm st sbvProg = result
 
       _            -> tbd "Multiple return values"
 
-  args = map mkParam (cgInputs st)
+  ins  = map mkInput  (cgInputs  st)
+  outs = map mkOutput (cgOutputs st)
 
 -- | Generate parameters for an LLVM function.
-mkParam :: (String,CgVal) -> Type
-mkParam (_, val) =
+mkInput :: (String,CgVal) -> Type
+mkInput (_, val) =
   case val of
     CgAtomic o       -> llvmType (kindOf o)
     CgArray os@(o:_) -> ptrT (arrayT (fromIntegral (length os))
                                      (llvmType (kindOf o)))
-    CgArray _        -> die "mkParam: CgArray with no elements!"
+    CgArray _        -> die "mkInput: CgArray with no elements!"
+
+-- | Generate output parameters for an LLVM function.
+mkOutput :: (String,CgVal) -> Type
+mkOutput (_,val) =
+  case val of
+    CgAtomic o       -> ptrT (llvmType (kindOf o))
+    CgArray os@(o:_) -> ptrT (arrayT (fromIntegral (length os))
+                                     (llvmType (kindOf o)))
+    CgArray _        -> die "mkOutput: CgArray with no elements!"
 
 
 -- | Translate from SBV Kinds to LLVM Types.
@@ -120,14 +132,18 @@ llvmType KReal          = error "llvmType: KReal"
 llvmType KUserSort{}    = error "llvmType: KUserSort"
 
 
-genLLVMProg :: Env -> Intrinsics -> Result -> [(Typed Value, (String,CgVal))]
+genLLVMProg :: Env -> Intrinsics -> Result
+            -> [(Typed Value, (String,CgVal))]
+            -> [(Typed Value, (String,CgVal))]
             -> BB Env
 genLLVMProg env0 ints
   (Result kindInfo _ cgs ins preConsts tbls arrs us _ (SBVPgm asgns) cstrs _)
-  args
+  args outs
   = do let env1 = bindConsts preConsts env0
        env2 <- foldM rnArg env1 args
-       F.foldlM (toStmt ints) env2 asgns
+       env3 <- F.foldlM (toStmt ints) env2 asgns
+       mapM_ (storeOutput env3) outs
+       return env3
   where
 
   -- add entries in the environment for mappings to arguments
@@ -144,6 +160,22 @@ genLLVMProg env0 ints
   unpackArg arr cs (off,i) =
     do tv <- extractValue arr off
        return (bindValue i tv cs)
+
+
+storeOutput :: Env -> (Typed Value, (String,CgVal)) -> BB ()
+
+storeOutput env (tv, (_, CgAtomic o)) =
+  store (swValue env o) tv Nothing
+
+storeOutput env (tv, (_, CgArray os@(o:_))) =
+  zipWithM_ storeAt [0 ..] os
+  where
+  ty = PtrTo (llvmType (kindOf o))
+
+  storeAt :: Int -> SW -> BB ()
+  storeAt off o =
+    do ptr <- getelementptr ty tv [ iT 32 -: (0 :: Int), iT 32 -: off ]
+       store (swValue env o) ptr Nothing
 
 
 -- Environment -----------------------------------------------------------------
