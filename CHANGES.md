@@ -1,9 +1,62 @@
 * Hackage: <http://hackage.haskell.org/package/sbv>
 * GitHub:  <http://leventerkok.github.com/sbv/>
 
-* Latest Hackage released version: 4.1, 2015-03-06
+* Latest Hackage released version: 4.2, 2015-03-17
 
-### Version 4.2, Not yet released
+### Version 4.3, Not yet released
+
+  * Code clean-up: remove mbMinBound/mbMaxBound thus allowing less calls to
+    unliteral. Contributed by Brian Huffman.
+
+  * Introduce Data.SBV.Dynamic, by Brian Huffman. This is mostly an internal
+    reorg of the SBV codebase, and end-users should not be impacted by the
+    changes. The introduction of the Dynamic SBV variant (i.e., one that does
+    not mandate a phantom type as in "SBV Word8" etc. allows library writers
+    more flexibility as they deal with arbitrary bit-vector sizes. The main
+    customor of these changes are the Cryptol language and the associated
+    toolset, but other developers building on top of SBV can find it useful
+    as well. NB: The "strongly-typed" aspect of SBV is still the main way
+    end-users should interact with SBV, and nothing changed in that respect!
+
+  * Add symbolic variants of floating-point rounding-modes for convenience
+
+  * Rename toSReal to sIntegerToSReal, which captures the intent more clearly
+
+  * Introduce FP conversion functions: fpToSReal, sRealToSFloat, and sRealToSDouble
+
+  * Rework floating point classifiers. Remove isSNaN and isFPPoint (both renamed),
+    and add the following new recognizers:
+
+       * isNormalFP
+       * isSubnormalFP
+       * isZeroFP
+       * isInfiniteFP
+       * isNaNFP
+       * isNegativeFP
+       * isPositiveFP
+       * isNegativeZeroFP
+       * isPositiveZeroFP
+       * isPointFP
+
+  * Reimplement sbvTestBit, by Brian Huffman. This version is much faster at large
+    word sizes, as it avoids the costly mask generation.
+
+  * Drop the "Equality" class. This essentially removes the "===" method, which
+    allowed for higher-order function equality. Turns out this was hardly ever
+    used, and was causing issues with the Overlapping instances. No reason
+    to complicate; and thus dropped it. If you were using it, simply eta-expand
+    until you reach the equality that you need at a base-type.
+
+  * Drop the "Provable" instance that took an array instance as argument. Again,
+    this feature was very rarely used, and was not well supported due to models for
+    arrays not being readily available in many solvers via SMT-Lib. Also was causing
+    issues with Overlapping-instances. If you were using this, simply use the 'newArray'
+    function directly from within the Symbolic monad; which will give you the same
+    behavior, at the cost of a bit more typing.
+
+  * Code changes to suppress warnings with GHC7.10. General clean-up.
+
+### Version 4.2, 2015-03-17
 
   * Add exponentiation (.^). Thanks to Daniel Wagner for contributing the code!
 
@@ -14,6 +67,10 @@
   * Silence some hlint/ghci warnings. Thanks to Trevor Elliott for the patch!
 
   * Haddock documentation fixes, improvements, etc.
+  
+  * Change ABC default option string to %blast; "&sweep -C 5000; &syn4; &cec -s -m -C 2000"
+    which seems to give good results. Use SBV_ABC_OPTIONS environment variable (or
+    via abc.rc file and a combination of SBV_ABC_OPTIONS) to experiment.
 
 ### Version 4.1, 2015-03-06
 

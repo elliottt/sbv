@@ -42,6 +42,8 @@ test: install
 	@echo "*** Starting inline tests.."
 	@(set -o pipefail; $(TIME) doctest ${TSTSRCS} 2>&1)
 	@echo "*** Starting external test suite.."
+	@# Note we use "-s" here skipping no-solver tests; which are covered
+	@# in the cabal test suite right below.
 	@$(TIME) dist/build/SBVUnitTests/SBVUnitTests -s
 	@echo "*** Starting internal cabal test suite.."
 	@SBV_Z3=doesnotexist $(TIME) $(CABAL) test
@@ -60,7 +62,7 @@ clean:
 docs:
 	@(set -o pipefail; $(CABAL) haddock --haddock-option=--no-warnings --hyperlink-source 2>&1 | $(SIMPLIFY))
 
-release: clean install sdist hlint test docs
+release: clean install sdist hlint docs test
 	@echo "*** SBV is ready for release!"
 
 # use this as follows: make gold TGTS="cgUSB5"
@@ -69,7 +71,8 @@ release: clean install sdist hlint test docs
 gold: install
 	dist/build/SBVUnitTests/SBVUnitTests -c ${TGTS}
 
-hlint: install
+hlint: 
+	@rm -f hlintReport.html
 	@echo "Running HLint.."
 	@hlint Data SBVUnitTest -q -rhlintReport.html -i "Use otherwise" -i "Parse error" -i "Use fewer imports"
 
