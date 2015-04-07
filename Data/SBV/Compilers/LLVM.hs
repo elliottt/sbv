@@ -40,11 +40,11 @@ compileToLLVM' nm f =
 
 -- Unexpected input, or things we will probably never support
 die :: String -> a
-die msg = error $ "SBV->C: Unexpected: " ++ msg
+die msg = error $ "SBV->LLVM: Unexpected: " ++ msg
 
 -- Unsupported features, or features TBD
 tbd :: String -> a
-tbd msg = error $ "SBV->C: Not yet supported: " ++ msg
+tbd msg = error $ "SBV->LLVM: Not yet supported: " ++ msg
 
 data SBVToLLVM = SBVToLLVM
 
@@ -62,8 +62,8 @@ data Intrinsics = Intrinsics { llvm_fabs_f32 :: Typed Value
 -- | Declare intrinsics used by SBV.
 declareIntrinsics :: LLVM Intrinsics
 declareIntrinsics  =
-  do llvm_fabs_f32 <- declare floatT  "llvm.fabs.f32" [ floatT] False
-     llvm_fabs_f64 <- declare doubleT "llvm.fabs.f64" [doubleT] False
+  do llvm_fabs_f32 <- declare floatT  (Symbol "llvm.fabs.f32") [ floatT] False
+     llvm_fabs_f64 <- declare doubleT (Symbol "llvm.fabs.f64") [doubleT] False
      return Intrinsics { .. }
 
 cgen :: CgConfig -> String -> CgState -> Result -> CgPgmBundle
