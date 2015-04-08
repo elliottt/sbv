@@ -6,17 +6,14 @@ module Data.SBV.Compilers.LLVM (
   ) where
 
 import Data.SBV.BitVectors.Data
-import Data.SBV.BitVectors.PrettyNum (shex, showCFloat, showCDouble)
 import Data.SBV.Compilers.CodeGen
 
 import           Control.Monad (foldM,zipWithM_)
 import qualified Data.Foldable as F
 import qualified Data.Map.Strict as Map
-import qualified Data.Sequence as Seq
 import           Data.String (IsString(..))
 import           System.Random (randoms,newStdGen)
-import           Text.LLVM hiding (Result,And,Or,Xor,Shl,Shr)
-import           Text.PrettyPrint.HughesPJ (render)
+import           Text.LLVM hiding (Result,And,Or,Xor,Shl)
 
 
 ---------------------------------------------------------------------------
@@ -52,6 +49,7 @@ instance CgTarget SBVToLLVM where
   targetName _ = "LLVM"
   translate _  = cgen
 
+floatT, doubleT :: Type
 floatT  = PrimType (FloatType Float)
 doubleT = PrimType (FloatType Double)
 
@@ -80,9 +78,9 @@ cgen cfg nm st sbvProg = result
        env  <- bindUninterpreted us emptyEnv
        _ <- define' emptyFunAttrs rty (fromString nm) (ins ++ outs) False $ \ as ->
               do let (is,os) = splitAt (length ins) as
-                 env <- genLLVMProg env ints sbvProg (zip is (cgInputs  st))
-                                                     (zip os (cgOutputs st))
-                 end env
+                 env' <- genLLVMProg cfg env ints sbvProg (zip is (cgInputs  st))
+                                                          (zip os (cgOutputs st))
+                 end env'
 
        return ()
 
@@ -124,7 +122,7 @@ mkOutput (_,val) =
 -- | Translate from SBV Kinds to LLVM Types.
 llvmType :: Kind -> Type
 llvmType KBool          = PrimType (Integer 1)
-llvmType (KBounded s w) = PrimType (Integer (fromIntegral w))
+llvmType (KBounded _ w) = PrimType (Integer (fromIntegral w))
 llvmType KFloat         = PrimType (FloatType Float)
 llvmType KDouble        = PrimType (FloatType Double)
 llvmType KUnbounded     = error "llvmType: KUnbounded"
@@ -132,16 +130,17 @@ llvmType KReal          = error "llvmType: KReal"
 llvmType KUserSort{}    = error "llvmType: KUserSort"
 
 
-genLLVMProg :: Env -> Intrinsics -> Result
+genLLVMProg :: CgConfig
+            -> Env -> Intrinsics -> Result
             -> [(Typed Value, (String,CgVal))]
             -> [(Typed Value, (String,CgVal))]
             -> BB Env
-genLLVMProg env0 ints
-  (Result kindInfo _ cgs ins preConsts tbls arrs us _ (SBVPgm asgns) cstrs _)
+genLLVMProg cfg env0 ints
+  (Result _ _ _ _ preConsts tbls arrs us _ (SBVPgm asgns) _ _)
   args outs
   = do let env1 = bindConsts preConsts env0
        env2 <- foldM rnArg env1 args
-       env3 <- F.foldlM (toStmt ints) env2 asgns
+       env3 <- F.foldlM (toStmt cfg ints) env2 asgns
        mapM_ (storeOutput env3) outs
        return env3
   where
@@ -167,26 +166,32 @@ storeOutput :: Env -> (Typed Value, (String,CgVal)) -> BB ()
 storeOutput env (tv, (_, CgAtomic o)) =
   store (swValue env o) tv Nothing
 
-storeOutput env (tv, (_, CgArray os@(o:_))) =
+storeOutput env (tv, (_, CgArray os@(e:_))) =
   zipWithM_ storeAt [0 ..] os
   where
-  ty = PtrTo (llvmType (kindOf o))
+  ty = PtrTo (llvmType (kindOf e))
 
   storeAt :: Int -> SW -> BB ()
   storeAt off o =
     do ptr <- getelementptr ty tv [ iT 32 -: (0 :: Int), iT 32 -: off ]
        store (swValue env o) ptr Nothing
 
+storeOutput _ (_, (_, CgArray [])) =
+  die "storeOutput: empty output array"
+
 
 -- Environment -----------------------------------------------------------------
 
 -- | The mapping from names in SBV to names in the generated assembly.
 data Env = Env { envValues        :: Map.Map SW (Typed Value)
+               , envTables        :: Map.Map Int (Typed Value)
                , envUninterpreted :: Map.Map String (Typed Value)
                }
 
 emptyEnv :: Env
-emptyEnv  = Env { envValues = Map.empty, envUninterpreted = Map.empty }
+emptyEnv  = Env { envValues = Map.empty
+                , envTables = Map.empty
+                , envUninterpreted = Map.empty }
 
 bindConsts :: [(SW,CW)] -> Env -> Env
 bindConsts cs Env { .. } = Env { envValues = Map.union new envValues, .. }
@@ -209,8 +214,8 @@ bindUninterpreted us Env { .. } =
               tv <- global attrs (Symbol n) (llvmType t) Nothing
               return (Map.insert n tv env)
 
-    _   -> do let (args,[ret]) = splitAt (length ts - 1) ts
-              tv <- declare (llvmType ret) (Symbol n) (map llvmType args) False
+    _   -> do let (args,[rty]) = splitAt (length ts - 1) ts
+              tv <- declare (llvmType rty) (Symbol n) (map llvmType args) False
               return (Map.insert n tv env)
 
 
@@ -219,6 +224,10 @@ bindValue sw tv Env { .. } = Env { envValues = Map.insert sw tv envValues, .. }
 
 lookupSW :: SW -> Env -> Maybe (Typed Value)
 lookupSW sw Env { .. } = Map.lookup sw envValues
+
+-- | Lookup a table in the environment.
+lookupTable :: Int -> Env -> Maybe (Typed Value)
+lookupTable ix env = Map.lookup ix (envTables env)
 
 lookupUninterpreted :: String -> Env -> Maybe (Typed Value)
 lookupUninterpreted n Env { .. } = Map.lookup n envUninterpreted
@@ -248,28 +257,23 @@ swValue env sw
 mkTyped :: (HasKind kind, IsValue a) => kind -> a -> Typed Value
 mkTyped kind a = llvmType (kindOf kind) -: a
 
-mkConst :: CW -> Typed Value
-mkConst (CW KFloat           (CWFloat   f)) = llvmType KFloat  -: f
-mkConst (CW KDouble          (CWDouble  f)) = llvmType KDouble -: f
-mkConst (CW k@(KBounded s w) (CWInteger i)) = llvmType k       -: i
-
 
 -- Statements ------------------------------------------------------------------
 
-toStmt :: Intrinsics -> Env -> (SW,SBVExpr) -> BB Env
-toStmt ints env (res,SBVApp op sws) =
+toStmt :: CgConfig -> Intrinsics -> Env -> (SW,SBVExpr) -> BB Env
+toStmt CgConfig { .. } ints env (res,SBVApp op sws) =
   do val <- stmts
      return (bindValue res val env)
 
   where
+
   stmts = case op of
 
     Ite | [c,t,f] <- args ->
       select c t f
 
     UNeg | [a] <- args ->
-        let zero = const (ValInteger 0) `fmap` a
-            kind = kindOf (head sws)
+        let kind = kindOf (head sws)
          in llvmBinOp Minus kind (const (int 0) `fmap` a) a
 
     Abs | [a] <- args ->
@@ -277,7 +281,7 @@ toStmt ints env (res,SBVApp op sws) =
         KFloat           -> call (llvm_fabs_f32 ints) [a]
         KDouble          -> call (llvm_fabs_f64 ints) [a]
         KBounded False _ -> return a
-        KBounded True  w -> do cond <- icmp Isgt a      (int 0)
+        KBounded True  _ -> do cond <- icmp Isgt a      (int 0)
                                a'   <- bxor a           (int (negate 1))
                                select cond a =<< add a' (int 1)
         kind             -> fail ("toStmt: unsupported kind for abs: " ++ show kind)
@@ -310,6 +314,7 @@ toStmt ints env (res,SBVApp op sws) =
         KBounded _ w -> do u <- shl  a (w - n)
                            l <- lshr a n
                            bor u l
+        _            -> die "Invalid arguments to Ror"
 
     -- sizeof a > i >= j >= 0
     Extract i j | [a] <- args ->
@@ -352,6 +357,20 @@ toStmt ints env (res,SBVApp op sws) =
       | otherwise ->
         die ("Unknown uninterpreted constant: " ++ s)
 
+
+    -- table lookup
+    LkUp (tblIx, _, resTy, _) ix def ->
+      case lookupTable tblIx env of
+        Just table | not cgRTC -> lkup table
+                   | otherwise -> undefined
+
+        Nothing -> die ("LkUp: Unknown table index: " ++ show tblIx)
+      where
+      lkup table =
+        do ptr <- getelementptr (llvmType resTy) table [ iT 32 -: (0 :: Int)
+                                                       , swValue env ix ]
+           load ptr Nothing
+
         -- binary operators
     _ | op `elem` [ Plus, Times, Minus, Quot, Rem, Equal, NotEqual, LessThan
                   , GreaterThan, And, Or, XOr ]
@@ -359,7 +378,7 @@ toStmt ints env (res,SBVApp op sws) =
         let kind = kindOf (head sws)
          in llvmBinOp op kind a b
 
-    FPRound str -> tbd "FPRound"
+    FPRound _ -> tbd "FPRound"
 
     _ -> die $ "Received operator " ++ show op ++ " applied to " ++ show sws
 
@@ -405,3 +424,5 @@ llvmBinOp GreaterThan k | isFloating k = fcmp Fogt
 llvmBinOp And _ = band
 llvmBinOp Or  _ = bor
 llvmBinOp XOr _ = bxor
+
+llvmBinOp op _ = \ _ _ -> die ("llvmBinOp: Unsupported operation: " ++ show op)
