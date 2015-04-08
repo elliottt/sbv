@@ -10,7 +10,10 @@ import Data.SBV.Compilers.CodeGen
 
 import           Control.Monad (foldM,zipWithM_)
 import qualified Data.Foldable as F
+import           Data.List (partition)
 import qualified Data.Map.Strict as Map
+import           Data.Maybe (isJust)
+import qualified Data.Sequence as Seq
 import           Data.String (IsString(..))
 import           System.Random (randoms,newStdGen)
 import           Text.LLVM hiding (Result,And,Or,Xor,Shl)
@@ -75,17 +78,44 @@ cgen cfg nm st sbvProg = result
 
   (_,m) = runLLVM $
     do ints <- declareIntrinsics
-       env  <- bindUninterpreted us emptyEnv
+       env  <- bindTables (map snd globalTables)
+                   =<< bindUninterpreted us (bindConsts consts emptyEnv)
        _ <- define' emptyFunAttrs rty (fromString nm) (ins ++ outs) False $ \ as ->
               do let (is,os) = splitAt (length ins) as
-                 env' <- genLLVMProg cfg env ints sbvProg (zip is (cgInputs  st))
-                                                          (zip os (cgOutputs st))
+                 env' <- genLLVMProg cfg env ints (zip is (cgInputs  st))
+                                                  (zip os (cgOutputs st))
+                                                  stmts
                  end env'
 
        return ()
 
-  Result _ _ _ _ _ _ _ us _ _ _ _ = sbvProg
+  Result _ _ _ _ consts tbls _ us _ (SBVPgm asgns) _ _ = sbvProg
 
+  -- partition the tables out into constant and data-dependent definitions
+  (globalTables,depTables) = partition (\ (i,_) -> i == -1)
+                                [ (tableId vals, t) | t@(_,vals) <- tbls ]
+  tableId vals = maximum (-1 : map getNodeId vals)
+
+
+  -- merge table declarations and assignments
+  stmts = fmap snd
+        $ Seq.sortBy compareStmt
+        $ Seq.fromList [ (n,MakeTable t) | (n,t) <- depTables ]
+   Seq.>< fmap addNodeId asgns
+    where
+    compareStmt (i,l) (j,r)
+      | i < j     = LT
+      | otherwise = GT
+
+  addNodeId a@(sw,_) = (getNodeId sw, MakeAssign a)
+
+  -- retrieve the id of a variable, or produce -1 in the case of a constant
+  getNodeId s@(SW _ (NodeId n)) | constSw s = -1
+                                | True      = n
+  constSw s = isJust (lookup s consts)
+
+  -- determine the return type of the function, and produce an action in the BB
+  -- monad that will handle returning results (if there are any)
   (rty,end) =
     case cgReturns st of
 
@@ -97,6 +127,8 @@ cgen cfg nm st sbvProg = result
 
       _            -> tbd "Multiple return values"
 
+  -- the list of types for both inputs and outputs, used to produce the
+  -- prototype
   ins  = map mkInput  (cgInputs  st)
   outs = map mkOutput (cgOutputs st)
 
@@ -131,16 +163,15 @@ llvmType KUserSort{}    = error "llvmType: KUserSort"
 
 
 genLLVMProg :: CgConfig
-            -> Env -> Intrinsics -> Result
+            -> Env -> Intrinsics
             -> [(Typed Value, (String,CgVal))]
             -> [(Typed Value, (String,CgVal))]
+            -> Seq.Seq SbvStmt
             -> BB Env
-genLLVMProg cfg env0 ints
-  (Result _ _ _ _ preConsts tbls arrs us _ (SBVPgm asgns) _ _)
-  args outs
-  = do let env1 = bindConsts preConsts env0
-       env2 <- foldM rnArg env1 args
-       env3 <- F.foldlM (toStmt cfg ints) env2 asgns
+genLLVMProg cfg env1 ints
+  args outs stmts
+  = do env2 <- foldM rnArg env1 args
+       env3 <- F.foldlM (toStmt cfg ints) env2 stmts
        mapM_ (storeOutput env3) outs
        return env3
   where
@@ -186,7 +217,7 @@ storeOutput _ (_, (_, CgArray [])) =
 data Env = Env { envValues        :: Map.Map SW (Typed Value)
                , envTables        :: Map.Map Int (Typed Value)
                , envUninterpreted :: Map.Map String (Typed Value)
-               }
+               } deriving (Show)
 
 emptyEnv :: Env
 emptyEnv  = Env { envValues = Map.empty
@@ -218,6 +249,29 @@ bindUninterpreted us Env { .. } =
               tv <- declare (llvmType rty) (Symbol n) (map llvmType args) False
               return (Map.insert n tv env)
 
+-- | Add a table to the environment.
+bindTable :: Int -> Typed Value -> Env -> Env
+bindTable i t Env { .. } = Env { envTables = Map.insert i t envTables, .. }
+
+-- | Emit tables as top-level constants.
+--
+-- NOTE: this should only be used when the elements are all constants.
+bindTables :: [((Int, Kind, Kind), [SW])] -> Env -> LLVM Env
+bindTables ts env0 @ Env { .. } =
+  do new <- foldM addTable envTables ts
+     return Env { envTables = new, .. }
+  where
+
+  addTable env ((ix, _, k), elts) =
+    do let attrs = GlobalAttrs { gaLinkage  = Just Internal
+                               , gaConstant = True }
+           vals  = array (llvmType k) [ typedValue (swValue env0 sw) | sw <- elts ]
+
+       table <- global attrs (Symbol ("table" ++ show ix))
+                     (typedType vals)
+                     (Just (typedValue vals))
+
+       return (Map.insert ix table env)
 
 bindValue :: SW -> Typed Value -> Env -> Env
 bindValue sw tv Env { .. } = Env { envValues = Map.insert sw tv envValues, .. }
@@ -260,14 +314,32 @@ mkTyped kind a = llvmType (kindOf kind) -: a
 
 -- Statements ------------------------------------------------------------------
 
-toStmt :: CgConfig -> Intrinsics -> Env -> (SW,SBVExpr) -> BB Env
-toStmt CgConfig { .. } ints env (res,SBVApp op sws) =
-  do val <- stmts
-     return (bindValue res val env)
+data SbvStmt = MakeTable  ((Int,Kind,Kind),[SW])
+             | MakeAssign (SW,SBVExpr)
+               deriving (Show)
+
+toStmt :: CgConfig -> Intrinsics -> Env -> SbvStmt -> BB Env
+toStmt CgConfig { .. } ints env sbv = stmts sbv
 
   where
 
-  stmts = case op of
+  nameResult sw val = return (bindValue sw val env)
+
+  stmts (MakeTable ((ix,_,k),vals)) =
+    do let eTy = llvmType k
+       table <- alloca (arrayT (fromIntegral (length vals)) eTy)
+                    Nothing Nothing
+
+       let loadEntry off val =
+             do ptr <- getelementptr (ptrT eTy) table [ iT 32 =: int 0
+                                                      , iT 32 =: int off ]
+                store (swValue env val) ptr Nothing
+
+       zipWithM_ loadEntry [0 ..] vals
+
+       return (bindTable ix table env)
+
+  stmts (MakeAssign (res,SBVApp op sws)) = nameResult res =<< case op of
 
     Ite | [c,t,f] <- args ->
       select c t f
@@ -284,7 +356,7 @@ toStmt CgConfig { .. } ints env (res,SBVApp op sws) =
         KBounded True  _ -> do cond <- icmp Isgt a      (int 0)
                                a'   <- bxor a           (int (negate 1))
                                select cond a =<< add a' (int 1)
-        kind             -> fail ("toStmt: unsupported kind for abs: " ++ show kind)
+        kind             -> die ("toStmt: unsupported kind for abs: " ++ show kind)
 
     -- Not is only ever used with i1
     Not | [a] <- args ->
@@ -359,17 +431,13 @@ toStmt CgConfig { .. } ints env (res,SBVApp op sws) =
 
 
     -- table lookup
-    LkUp (tblIx, _, resTy, _) ix def ->
+    LkUp (tblIx, _, resTy, len) ix def ->
       case lookupTable tblIx env of
-        Just table | not cgRTC -> lkup table
-                   | otherwise -> undefined
+        Just table -> tableLookup cgRTC env resTy table len (swValue env ix)
+                                                            (swValue env def)
+        Nothing    -> die ("LkUp: Unknown table index: " ++ show tblIx)
 
-        Nothing -> die ("LkUp: Unknown table index: " ++ show tblIx)
       where
-      lkup table =
-        do ptr <- getelementptr (llvmType resTy) table [ iT 32 -: (0 :: Int)
-                                                       , swValue env ix ]
-           load ptr Nothing
 
         -- binary operators
     _ | op `elem` [ Plus, Times, Minus, Quot, Rem, Equal, NotEqual, LessThan
@@ -382,7 +450,25 @@ toStmt CgConfig { .. } ints env (res,SBVApp op sws) =
 
     _ -> die $ "Received operator " ++ show op ++ " applied to " ++ show sws
 
-  args = map (swValue env) sws
+    where
+
+    args = map (swValue env) sws
+
+
+tableLookup :: Bool -> Env
+            -> Kind -> Typed Value -> Int -> Typed Value -> Typed Value
+            -> BB (Typed Value)
+tableLookup rtc env resK table len ix def
+    -- explicitly disabled index checks
+  | not rtc   = lookupEntry
+  | otherwise = undefined
+
+  where
+  resTy = ptrT (llvmType resK)
+
+  lookupEntry =
+    do ptr <- getelementptr resTy table [ iT 32 -: (0 :: Int), ix ]
+       load ptr Nothing
 
 isFloating :: Kind -> Bool
 isFloating KFloat  = True
